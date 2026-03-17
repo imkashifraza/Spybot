@@ -10,7 +10,7 @@ require('dotenv').config();
 
 const token = process.env.TELEGRAM_BOT_TOKEN || '';
 const id = process.env.TELEGRAM_CHAT_ID || '';
-const PORT = process.env.PORT || 8999;
+const PORT = process.env.PORT || 3000;
 
 const app = express();
 const appServer = http.createServer(app);
